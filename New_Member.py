@@ -147,7 +147,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== 5. Bot 启动入口 ====================
 if __name__ == "__main__":
     # 请确认此处填写的是正确的 Telegram Bot Token
-    BOT_TOKEN = "7887714392:AAEjY2YwXQk_gP23fO0A1gXJ9G4Yx1x1x1x" 
+    BOT_TOKEN = "8870233140:AAGqcayS17mIUxrAI6y6ZPTi6hKXIXLAAME" 
     
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
