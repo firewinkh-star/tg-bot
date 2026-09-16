@@ -55,18 +55,19 @@ init_db()
 # ==================== 3. 报单解析与统计逻辑 ====================
 def parse_report(text: str):
     patterns = {
-        "staff": r"STAFF\s*=\s*(.+)",
-        "code": r"CODE\s*=\s*(.+)",
-        "game": r"GAME\s*=\s*(.+)",
+        "staff": r"STAFF\s*=\s*([^\r\n]+)",
+        "code": r"CODE\s*=\s*([^\r\n]+)",
+        "game": r"GAME\s*=\s*([^\r\n]+)",
         "deposit": r"DEPOSIT\s*=\s*([0-9.]+)",
-        "source": r"FROM\s*=\s*(.+)",
-        "bonus": r"BONUS\s*=\s*(.+)"
+        "source": r"FROM\s*=\s*([^\r\n]+)",
+        "bonus": r"BONUS\s*=\s*([^\r\n]+)"
     }
     
     data = {}
     for key, pattern in patterns.items():
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
+            # strip() 会自动清除名字前后多余的空格、表情或回车
             data[key] = match.group(1).strip()
         else:
             return None  # 格式不符则忽略
