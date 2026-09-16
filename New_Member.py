@@ -1,158 +1,156 @@
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+import os
 import re
 import sqlite3
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
-from difflib import get_close_matches
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
-# 1. 基础配置
-BOT_TOKEN = "8870233140:AAGqcayS17mIUxrAI6y6ZPTi6hKXIXLAAME"
-TARGET_TOPIC_ID = 6  # 锁定 New Member 话题
+# ==================== 1. Render 免费层端口保活（防 Timeout 关停） ====================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is alive and running!")
 
-# 2. 初始化数据库 (持久化保存，重启不丢失)
+    def log_message(self, format, *args):
+        # 屏蔽 HTTP 请求日志，保持控制台整洁
+        return
+
+def run_health_check_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+# 后台异步启动 Web 服务，专门给 Render 扫描端口用
+threading.Thread(target=run_health_check_server, daemon=True).start()
+
+
+# ==================== 2. 数据库配置与初始化 ====================
+DB_NAME = "bot_data.db"
+
 def init_db():
-    conn = sqlite3.connect('bot_data.db')
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS records (
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             staff TEXT,
+            code TEXT,
+            game TEXT,
+            deposit REAL,
             source TEXT,
-            created_at DATE
+            bonus TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    ''')
+    """)
     conn.commit()
     conn.close()
 
-def clean_input(text):
-    if not text:
-        return ""
-    # 去除表情符号和特殊符号，只保留英文、数字、中文及空格
-    cleaned = re.sub(r'[^\w\s]', '', text).strip()
-    # 统一转换为首字母大写格式 (例如 pha lin -> Pha Lin)
-    return cleaned.title()
+init_db()
 
-def get_existing_names(category="staff"):
-    """获取数据库中已存在的所有员工或渠道列表"""
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
-    cursor.execute(f"SELECT DISTINCT {category} FROM records WHERE {category} IS NOT NULL AND {category} != ''")
-    names = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return names
 
-def match_closest_name(input_name, category="staff"):
-    """如果打错字或格式微调，自动与历史记录中最相似的名称匹配 (80% 相似度阈值)"""
-    if not input_name:
-        return ""
+# ==================== 3. 报单解析与统计逻辑 ====================
+def parse_report(text: str):
+    patterns = {
+        "staff": r"STAFF\s*=\s*(.+)",
+        "code": r"CODE\s*=\s*(.+)",
+        "game": r"GAME\s*=\s*(.+)",
+        "deposit": r"DEPOSIT\s*=\s*([0-9.]+)",
+        "source": r"FROM\s*=\s*(.+)",
+        "bonus": r"BONUS\s*=\s*(.+)"
+    }
     
-    cleaned = clean_input(input_name)
-    existing_list = get_existing_names(category)
-    
-    # 查找模糊匹配
-    matches = get_close_matches(cleaned, existing_list, n=1, cutoff=0.8)
-    if matches:
-        return matches[0]  # 如果找到匹配的旧名字，直接用旧名字
-    return cleaned  # 找不到就作为新名字存入
+    data = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            data[key] = match.group(1).strip()
+        else:
+            return None  # 格式不符则忽略
+            
+    try:
+        data["deposit"] = float(data["deposit"].replace("$", ""))
+    except ValueError:
+        data["deposit"] = 0.0
 
-def add_record(staff_name, source_channel):
-    conn = sqlite3.connect('bot_data.db')
+    return data
+
+def save_report(data):
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    today = datetime.now().strftime("%Y-%m-%d")
-    cursor.execute(
-        "INSERT INTO records (staff, source, created_at) VALUES (?, ?, ?)",
-        (staff_name, source_channel, today)
-    )
+    cursor.execute("""
+        INSERT INTO reports (staff, code, game, deposit, source, bonus)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (data["staff"], data["code"], data["game"], data["deposit"], data["source"], data["bonus"]))
     conn.commit()
     conn.close()
 
-def generate_report():
-    conn = sqlite3.connect('bot_data.db')
+def get_stats(staff_name, source_name):
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    month_str = datetime.now().strftime("%Y-%m")
+
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
-    today = datetime.now().strftime("%Y-%m-%d")
-    this_month = datetime.now().strftime("%Y-%m")
 
-    # 查员工今日数据
-    cursor.execute("SELECT staff, COUNT(*) FROM records WHERE created_at = ? AND staff IS NOT NULL AND staff != '' GROUP BY staff", (today,))
-    staff_today = dict(cursor.fetchall())
+    # Staff 统计
+    cursor.execute("SELECT COUNT(*) FROM reports WHERE LOWER(staff) = LOWER(?) AND DATE(created_at) = DATE(?)", (staff_name, today_str))
+    staff_today = cursor.fetchone()[0]
 
-    # 查员工本月数据
-    cursor.execute("SELECT staff, COUNT(*) FROM records WHERE strftime('%Y-%m', created_at) = ? AND staff IS NOT NULL AND staff != '' GROUP BY staff", (this_month,))
-    staff_month = dict(cursor.fetchall())
+    cursor.execute("SELECT COUNT(*) FROM reports WHERE LOWER(staff) = LOWER(?) AND strftime('%Y-%m', created_at) = ?", (staff_name, month_str))
+    staff_month = cursor.fetchone()[0]
 
-    # 查来源今日数据
-    cursor.execute("SELECT source, COUNT(*) FROM records WHERE created_at = ? AND source IS NOT NULL AND source != '' GROUP BY source", (today,))
-    source_today = dict(cursor.fetchall())
+    # Source 统计
+    cursor.execute("SELECT COUNT(*) FROM reports WHERE LOWER(source) = LOWER(?) AND DATE(created_at) = DATE(?)", (source_name, today_str))
+    source_today = cursor.fetchone()[0]
 
-    # 查来源本月数据
-    cursor.execute("SELECT source, COUNT(*) FROM records WHERE strftime('%Y-%m', created_at) = ? AND source IS NOT NULL AND source != '' GROUP BY source", (this_month,))
-    source_month = dict(cursor.fetchall())
+    cursor.execute("SELECT COUNT(*) FROM reports WHERE LOWER(source) = LOWER(?) AND strftime('%Y-%m', created_at) = ?", (source_name, month_str))
+    source_month = cursor.fetchone()[0]
 
     conn.close()
 
-    msg = f"📊 **【New Member Report】**\n📅 Date: `{today}`\n\n"
-    
-    # 员工统计
-    msg += "👤 **Staff Performance**:\n"
-    all_staffs = sorted(list(set(list(staff_today.keys()) + list(staff_month.keys()))))
-    if not all_staffs:
-        msg += "  (No Data)\n"
-    else:
-        for s in all_staffs:
-            d_cnt = staff_today.get(s, 0)
-            m_cnt = staff_month.get(s, 0)
-            msg += f"• `{s}`: Today {d_cnt} | Month {m_cnt}\n"
-            
-    # 来源统计
-    msg += "\n🌐 **Source Channels**:\n"
-    all_sources = sorted(list(set(list(source_today.keys()) + list(source_month.keys()))))
-    if not all_sources:
-        msg += "  (No Data)\n"
-    else:
-        for f in all_sources:
-            d_cnt = source_today.get(f, 0)
-            m_cnt = source_month.get(f, 0)
-            msg += f"• `{f}`: Today {d_cnt} | Month {m_cnt}\n"
-            
-    return msg
+    return {
+        "staff_today": staff_today,
+        "staff_month": staff_month,
+        "source_today": source_today,
+        "source_month": source_month
+    }
 
+
+# ==================== 4. Telegram 消息处理Handler ====================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    thread_id = update.message.message_thread_id
     text = update.message.text
+    data = parse_report(text)
 
-    if thread_id != TARGET_TOPIC_ID:
-        return
+    if data:
+        save_report(data)
+        stats = get_stats(data["staff"], data["source"])
+        today_date = datetime.now().strftime("%Y-%m-%d")
 
-    lines = text.split('\n')
-    staff_name = None
-    source_channel = None
-
-    for line in lines:
-        if line.upper().startswith("STAFF="):
-            raw_val = line.split("=", 1)[1]
-            staff_name = match_closest_name(raw_val, category="staff")
-        elif line.upper().startswith("FROM="):
-            raw_val = line.split("=", 1)[1]
-            source_channel = match_closest_name(raw_val, category="source")
-
-    if staff_name or source_channel:
-        add_record(staff_name, source_channel)
-        report_msg = generate_report()
-
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            message_thread_id=TARGET_TOPIC_ID,
-            text=report_msg,
-            parse_mode="Markdown"
+        reply_text = (
+            f"📊【New Member Report】\n"
+            f"📅 Date: {today_date}\n\n"
+            f"👤 Staff Performance:\n"
+            f"• {data['staff']}: Today {stats['staff_today']} | Month {stats['staff_month']}\n\n"
+            f"🌐 Source Channels:\n"
+            f"• {data['source']}: Today {stats['source_today']} | Month {stats['source_month']}"
         )
 
+        await update.message.reply_text(reply_text)
+
+
+# ==================== 5. Bot 启动入口 ====================
 if __name__ == "__main__":
-    init_db()
-    print("Bot 已启动，正在监听指定 Topic...")
+    # 请确认此处填写的是正确的 Telegram Bot Token
+    BOT_TOKEN = "7887714392:AAEjY2YwXQk_gP23fO0A1gXJ9G4Yx1x1x1x" 
+    
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    
+    print("Bot 已启动，正在监听指定 Topic...")
     app.run_polling()
